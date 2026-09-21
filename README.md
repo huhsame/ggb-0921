@@ -4,7 +4,7 @@
 
 ## 쓰는 방법
 
-- **웹에서**: https://huh-air.github.io/gagyebu/
+- **웹에서**: https://huhsame.github.io/gagyebu/
 - **내 컴퓨터에서**: `index.html` 파일을 내려받아 더블클릭
 
 ## 기능

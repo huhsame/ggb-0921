@@ -245,6 +245,13 @@ h2 { font-size: 15px; font-weight: 700; letter-spacing: -0.01em; }
 .linkbtn { border: 0; background: none; padding: 2px 0; font-size: 13px; color: var(--muted); text-decoration: underline; text-underline-offset: 3px; }
 .linkbtn:hover { color: var(--ink); }
 
+/* ---------- 불러오는 중 (body[data-state]: boot → in) ---------- */
+body[data-state="boot"] :is(#app, .month, #today) { display: none; }
+body[data-state="in"] #boot { display: none; }
+.boot { max-width: 420px; margin: 16vh auto 0; text-align: center; color: var(--muted); }
+.boot::before { content: "🌕"; display: block; margin-bottom: 10px; font-size: 40px; animation: bob 3.4s ease-in-out infinite; }
+.boot .actions { justify-content: center; margin-top: 14px; }
+
 /* ---------- 헤더 ---------- */
 .top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 20px; margin-bottom: 16px; }
 .brandrow { display: flex; align-items: center; gap: 12px; }
@@ -589,7 +596,7 @@ dialog .actions .primary { flex: 0 0 auto; }
 }
 </style>
 </head>
-<body>
+<body data-state="boot">
 <style>
 .navbtn.theme .i-moon { display: none; }
 :root[data-theme="day"] .navbtn.theme .i-sun { display: none; }
@@ -655,8 +662,17 @@ dialog .actions .primary { flex: 0 0 auto; }
     </div>
   </header>
 
+  <section class="boot" id="boot" role="status" aria-live="polite">
+    <p id="bootMsg">내역을 불러오는 중…</p>
+    <div class="actions" id="bootActions" hidden>
+      <button type="button" class="btn" id="bootRetry">다시 시도</button>
+    </div>
+  </section>
+
+  <div id="app">
+
   <div class="notice top-warn" id="warn" role="status" hidden>
-    <span>이 브라우저에서는 저장이 막혀 있어요. 창을 닫으면 입력한 내용이 사라지니, 아래 ‘백업 저장’으로 파일을 보관해 주세요.</span>
+    <span id="warnTxt"></span>
   </div>
 
   <section class="panel hero reveal" style="--i:1" aria-label="한가위 인사">
@@ -780,13 +796,14 @@ dialog .actions .primary { flex: 0 0 auto; }
 
   <footer class="data">
     <div class="saekdong"></div>
-    <p>내역은 이 브라우저에만 저장돼요. 다른 기기나 브라우저에서 쓰려면 백업 파일로 옮겨 주세요.</p>
+    <p>내역은 온라인 데이터베이스(Supabase)에 저장돼요. 같은 주소로 열면 어느 기기에서든 같은 내역이 보여요.</p>
     <button type="button" class="btn sm" id="expJson">백업 저장 (JSON)</button>
     <button type="button" class="btn sm" id="expCsv">엑셀용 CSV</button>
     <button type="button" class="btn sm" id="impBtn">백업 불러오기</button>
     <button type="button" class="btn sm danger" id="wipe">내역 전체 삭제</button>
     <p class="blessing">보름달처럼 넉넉한 한가위 되세요 🌕</p>
   </footer>
+  </div>
 </div>
 
 <dialog id="budgetDlg" aria-labelledby="budgetTitle">
@@ -810,11 +827,12 @@ dialog .actions .primary { flex: 0 0 auto; }
 <input type="file" id="importFile" accept="application/json,.json" hidden>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.116.0/dist/umd/supabase.js" integrity="sha384-iLddHTLokph6Omwoyid4XKxHaWa6w41BnoEj0q5oOrzmYPpHIKt1wyjReA7s//pP" crossorigin="anonymous"></script>
+
 <script>
 (() => {
 'use strict';
 
-const KEY = 'gagyebu.v1';
 const CATS = {
   expense: ['식비', '카페·간식', '교통', '주거·통신', '쇼핑', '의료·건강', '문화·여가', '경조사', '기타 지출'],
   income: ['급여', '용돈', '부수입', '이자·환급', '기타 수입'],
@@ -840,9 +858,13 @@ const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate(
 const mkey = (y, m) => `${y}-${pad(m + 1)}`;
 const parseAmount = (s) => parseInt(String(s).replace(/\D/g, ''), 10) || 0;
 const rand = (a, b) => a + Math.random() * (b - a);
+// DB의 id 칸이 uuid라서 표준 uuid v4 모양으로 만든다 (randomUUID가 없는 환경 대비)
 const uid = () => {
   try { if (crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 };
 const retrigger = (el, cls) => { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); };
 
@@ -861,8 +883,79 @@ function countTo(el, to, ms = 850) {
   el._raf = requestAnimationFrame(step);
 }
 
-/* ---------- storage ---------- */
-let storageOk = true;
+/* ---------- Supabase ---------- */
+// 로그인이 없는 1인용 가계부라서, 이 주소와 키를 아는 사람은 누구나 DB의 내역을 읽고 고칠 수 있어요. (README 참고)
+const SUPABASE_URL = 'https://hnqgmmqfrelxevhtuuqb.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_XmUw-9WO8FuKm7ACT6vRdw_ic3vfuhA';
+const LEGACY_KEY = 'gagyebu.v1'; // 예전 버전이 내역을 넣어 두던 localStorage 키 (처음 열 때 옮기기용)
+// 로그인은 쓰지 않으니 로그인 세션을 저장·갱신하는 기능은 끈다
+const sb = window.supabase
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } })
+  : null;
+
+const rowToTx = (r) => ({
+  id: r.id, seq: r.seq, date: r.date, type: r.type, cat: r.cat, memo: r.memo, amount: Number(r.amount),
+  ...(r.sample ? { sample: true } : {}),
+});
+const txToRow = ({ id, seq, date, type, cat, memo, amount, sample }) => ({
+  id, ...(seq != null ? { seq } : {}), date, type, cat, memo, amount, sample: !!sample,
+});
+
+/* 서버의 전체 내역과 예산. budget이 null이면 설정 행이 아직 없는 상태(= 처음 여는 빈 DB). */
+async function fetchAll() {
+  const PAGE = 1000; // 서버가 한 번에 주는 행 수 상한
+  const tx = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await sb.from('transactions')
+      .select('id,seq,date,type,cat,memo,amount,sample').order('seq').range(from, from + PAGE - 1);
+    if (error) throw error;
+    tx.push(...data.map(rowToTx));
+    if (data.length < PAGE) break;
+  }
+  const { data: s, error } = await sb.from('settings').select('budget').maybeSingle();
+  if (error) throw error;
+  return { budget: s ? Number(s.budget) : null, tx };
+}
+
+/* 쓰기는 한 줄로 세워서 차례대로 보낸다. 화면은 먼저 바꾸고(낙관적 갱신),
+   하나라도 실패하면 서버에 실제로 있는 내용으로 되돌린다. */
+let queue = Promise.resolve(), pending = 0, failed = false;
+function run(build) {
+  pending++;
+  const job = queue.then(async () => {
+    let ok = true;
+    try { const { error } = await build(); if (error) throw error; }
+    catch (e) { console.error(e); ok = false; failed = true; }
+    if (--pending === 0) {
+      if (failed) {
+        failed = false;
+        toast('저장하지 못했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.');
+        await refresh();
+      } else setWarn('');
+    }
+    return ok;
+  });
+  queue = job;
+  return job;
+}
+const api = {
+  add: (t) => run(() => sb.from('transactions').insert(txToRow(t))),
+  update: (t) => { const { id, seq, ...row } = txToRow(t); return run(() => sb.from('transactions').update(row).eq('id', id)); },
+  remove: (id) => run(() => sb.from('transactions').delete().eq('id', id)),
+  clearSamples: () => run(() => sb.from('transactions').delete().eq('sample', true)),
+  wipe: () => run(() => sb.from('transactions').delete().not('id', 'is', null)),
+  budget: (v) => run(() => sb.from('settings').upsert({ id: 1, budget: v })),
+  replaceAll: (d) => run(() => replaceAllRpc(d)),
+};
+// 내역 전체를 한 번에 통째로 바꾼다. 서버에서 한 트랜잭션으로 처리해서, 도중에 실패해도 기존 내역은 그대로 남는다.
+const replaceAllRpc = (d) => sb.rpc('replace_all', {
+  p_budget: d.budget,
+  p_tx: d.tx.map(({ date, type, cat, memo, amount, sample }) => ({ date, type, cat, memo, amount, sample: !!sample })),
+});
+
+function readLegacy() {
+  try { return normalize(JSON.parse(localStorage.getItem(LEGACY_KEY))); } catch (e) { return null; }
+}
 
 function seed() {
   const now = new Date();
@@ -929,27 +1022,8 @@ function normalize(d) {
   return { v: 1, budget: Number.isFinite(b) && b > 0 ? b : 0, tx };
 }
 
-function load() {
-  let raw = null;
-  try { raw = localStorage.getItem(KEY); } catch (e) { storageOk = false; return seed(); }
-  if (raw === null) return seed();
-  try {
-    const d = normalize(JSON.parse(raw));
-    if (d) return d;
-  } catch (e) {}
-  // 저장된 내용이 깨진 경우: 덮어쓰기 전에 원본을 따로 보관한다.
-  try { localStorage.setItem(KEY + '.broken', raw); } catch (e) {}
-  return { v: 1, budget: 0, tx: [] };
-}
-
-function save() {
-  try { localStorage.setItem(KEY, JSON.stringify(db)); }
-  catch (e) { storageOk = false; }
-  $('#warn').hidden = storageOk;
-}
-
 /* ---------- state ---------- */
-let db = load();
+let db = { budget: 0, tx: [] }; // 서버에서 받아오기 전까지는 비어 있다
 const now0 = new Date();
 let view = { y: now0.getFullYear(), m: now0.getMonth() };
 const ui = { filter: 'all', q: '', editId: null, enter: true, fresh: null };
@@ -972,7 +1046,6 @@ function render() {
   renderList();
   renderBreakdown();
   $('#sampleNotice').hidden = !db.tx.some((t) => t.sample);
-  $('#warn').hidden = storageOk;
 }
 
 function renderSummary() {
@@ -1184,10 +1257,10 @@ function del(id) {
   if (i < 0) return;
   const [t] = db.tx.splice(i, 1);
   if (ui.editId === id) endEdit(true);
-  save(); fillMemoList(); render();
+  api.remove(id); fillMemoList(); render();
   toast('내역을 삭제했어요.', '되돌리기', () => {
     db.tx.splice(Math.min(i, db.tx.length), 0, t);
-    save(); fillMemoList(); render();
+    api.add(t); fillMemoList(); render(); // t에 seq가 있으면 원래 입력 순서 그대로 복원된다
   });
 }
 
@@ -1248,7 +1321,7 @@ $('#txForm').addEventListener('submit', (e) => {
   const r = $('#submitBtn').getBoundingClientRect();
   if (editing) {
     const i = db.tx.findIndex((x) => x.id === editing);
-    if (i >= 0) db.tx[i] = { ...t, id: editing };
+    if (i >= 0) { db.tx[i] = { ...t, id: editing, seq: db.tx[i].seq }; api.update(db.tx[i]); }
     ui.fresh = editing;
     ui.editId = null;
     $('#formTitle').textContent = '내역 추가';
@@ -1260,12 +1333,12 @@ $('#txForm').addEventListener('submit', (e) => {
   } else {
     const id = uid();
     db.tx.push({ id, ...t });
+    api.add(db.tx[db.tx.length - 1]);
     ui.fresh = id;
     toast(`${t.type === 'income' ? '수입' : '지출'} ${won(amount)}원을 추가했어요.`);
     if (t.type === 'income') burst(r.left + r.width / 2, r.top, [P.coin, P.coin, P.song('#F7F1E1'), P.song('#F6B8C4'), P.song('#A8D5A2'), P.star], 34);
     else burst(r.left + r.width / 2, r.top, [P.leaf('#E5533D'), P.leaf('#F08A2B'), P.star], 16);
   }
-  save();
   const [y, m] = t.date.split('-').map(Number);
   view = { y, m: m - 1 };
   f.amount.value = '';
@@ -1302,7 +1375,7 @@ $('#q').addEventListener('input', (e) => { ui.q = e.target.value; renderList(); 
 $('#clearSample').addEventListener('click', () => {
   db.tx = db.tx.filter((t) => !t.sample);
   if (ui.editId && !db.tx.some((t) => t.id === ui.editId)) endEdit(true);
-  save(); fillMemoList(); render();
+  api.clearSamples(); fillMemoList(); render();
   toast('예시를 지웠어요. 이제 직접 입력해 보세요.');
 });
 
@@ -1333,7 +1406,7 @@ $('#budgetForm').addEventListener('submit', (e) => {
   if (v === 'save') db.budget = parseAmount($('#budgetInput').value);
   else if (v === 'clear') db.budget = 0;
   else return;
-  save(); render();
+  api.budget(db.budget); render();
 });
 
 /* ---------- backup ---------- */
@@ -1347,7 +1420,8 @@ function download(name, text, type) {
 const stamp = () => ymd(new Date()).replace(/-/g, '');
 
 $('#expJson').addEventListener('click', () => {
-  download(`가계부-백업-${stamp()}.json`, JSON.stringify(db, null, 1), 'application/json');
+  const backup = { v: 1, budget: db.budget, tx: db.tx.map(({ seq, ...t }) => t) };
+  download(`가계부-백업-${stamp()}.json`, JSON.stringify(backup, null, 1), 'application/json');
 });
 $('#expCsv').addEventListener('click', () => {
   const q = (c) => `"${String(c).replace(/"/g, '""')}"`;
@@ -1364,10 +1438,12 @@ $('#importFile').addEventListener('change', async (e) => {
     const d = normalize(JSON.parse(await file.text()));
     if (!d) throw new Error('bad format');
     if (!confirm(`현재 내역 ${db.tx.length}건이 사라지고, 백업 파일의 ${d.tx.length}건으로 바뀝니다. 계속할까요?`)) return;
-    db = d;
+    db = { budget: d.budget, tx: d.tx };
     endEdit(true);
-    save(); fillMemoList(); ui.enter = true; render();
+    fillMemoList(); ui.enter = true; render();
     toast('백업을 불러왔어요.');
+    // 서버가 새 id를 매기므로, 저장이 끝나면 서버 쪽 내용으로 다시 받아 온다
+    api.replaceAll(d).then((ok) => { if (ok) refresh(); });
   } catch (err) {
     toast('불러오지 못했어요. 이 가계부에서 저장한 JSON 파일인지 확인해 주세요.');
   }
@@ -1377,7 +1453,7 @@ $('#wipe').addEventListener('click', () => {
   if (!confirm(`내역 ${db.tx.length}건을 모두 지울까요? 되돌릴 수 없으니 먼저 백업을 저장해 두는 걸 권해요.`)) return;
   db.tx = [];
   endEdit(true);
-  save(); fillMemoList(); render();
+  api.wipe(); fillMemoList(); render();
   toast('내역을 모두 지웠어요.');
 });
 
@@ -1489,6 +1565,74 @@ $('#theme').addEventListener('click', () => {
   )).catch(() => {});
 });
 
+/* ---------- 불러오기 ---------- */
+const setState = (s) => { document.body.dataset.state = s; }; // boot(불러오는 중) | in(가계부)
+function setWarn(msg) { $('#warnTxt').textContent = msg || ''; $('#warn').hidden = !msg; }
+
+/* DB가 아직 '새것'(비었거나 예시 내역뿐)일 때만 채워 준다.
+   이 브라우저에 예전(localStorage) 내역이 있으면 옮길지 묻고, 없으면 화면 구성용 예시를 넣는다.
+   d는 방금 받아 온 DB 내용. 새것일 때만 부르므로 replace_all이 진짜 내역을 덮어쓸 일은 없다. */
+async function firstRun(d) {
+  const legacy = readLegacy();
+  let moved = false;
+  try { moved = !!localStorage.getItem(LEGACY_KEY + '.migrated'); } catch (e) {}
+  let start;
+  if (!moved && legacy && legacy.tx.some((t) => !t.sample)) {
+    if (!confirm(`이 브라우저에 저장돼 있던 내역 ${legacy.tx.length}건을 데이터베이스로 옮길까요?\n\n‘취소’를 누르면 옮기지 않고 시작하고, 다른 내역을 넣기 전에 다시 열면 또 물어봐요. 이 브라우저의 예전 데이터는 어느 쪽이든 지우지 않아요.`)) return false;
+    start = legacy;
+  } else if (d.budget !== null || d.tx.length) return false; // 이미 한 번 채워진 DB
+  else if (legacy && !legacy.tx.length) start = legacy; // 다 지우고 쓰던 사람: 예산만 이어받는다
+  else start = seed();
+  const { error } = await replaceAllRpc(start);
+  if (error) throw error;
+  if (start === legacy) { try { localStorage.setItem(LEGACY_KEY + '.migrated', '1'); } catch (e) {} } // 다시 묻지 않게 표시
+  return true;
+}
+
+async function boot() {
+  $('#bootMsg').textContent = '내역을 불러오는 중…';
+  $('#bootActions').hidden = true;
+  setState('boot');
+  let d;
+  try {
+    d = await fetchAll();
+    // 내역이 없거나 예시뿐이면 아직 새 DB다
+    if (d.tx.every((t) => t.sample) && await firstRun(d)) d = await fetchAll();
+  } catch (e) {
+    console.error(e);
+    $('#bootMsg').textContent = '내역을 불러오지 못했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.';
+    $('#bootActions').hidden = false;
+    return;
+  }
+  db = { budget: d.budget ?? 0, tx: d.tx };
+  lastSync = Date.now();
+  endEdit(true);
+  fillMemoList(); ui.enter = true; render();
+  setWarn('');
+  setState('in');
+}
+
+/* 서버에 있는 내용으로 화면을 다시 맞춘다 (쓰기 실패 뒤, 다른 기기에서 고친 걸 볼 때) */
+let lastSync = 0;
+async function refresh() {
+  try {
+    const d = await fetchAll();
+    if (pending) return; // 받는 사이 새로 입력한 게 있어서 이 결과는 이미 낡았다
+    db = { budget: d.budget ?? 0, tx: d.tx };
+    lastSync = Date.now();
+    if (ui.editId && !db.tx.some((t) => t.id === ui.editId)) endEdit(true);
+    fillMemoList(); render(); setWarn('');
+  } catch (e) {
+    console.error(e);
+    setWarn('서버와 연결하지 못했어요. 지금 보이는 내용이 최신이 아니거나 저장되지 않았을 수 있어요.');
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  // 다른 기기에서 고친 내용을 탭으로 돌아왔을 때 가져온다
+  if (!document.hidden && !pending && document.body.dataset.state === 'in' && Date.now() - lastSync > 30000) refresh();
+});
+$('#bootRetry').addEventListener('click', boot);
+
 /* ---------- init ---------- */
 buildScene();
 $('#theme').setAttribute('aria-label', root.dataset.theme === 'day' ? '달밤 테마로 바꾸기' : '한지(낮) 테마로 바꾸기');
@@ -1498,6 +1642,9 @@ fillCats();
 f.date.value = defaultDate();
 fillMemoList();
 render();
+
+if (sb) boot();
+else $('#bootMsg').textContent = '서버에 연결할 도구를 불러오지 못했어요. 인터넷에 연결돼 있는지 확인하고 새로고침해 주세요.'; // CDN에서 못 받아온 경우
 })();
 </script>
 </body>
